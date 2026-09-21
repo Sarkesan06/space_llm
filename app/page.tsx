@@ -634,19 +634,6 @@ export default function Page() {
         </div>
       </header>
 
-      <section className="hero">
-        <div className="eyebrow">
-          <Sparkles size={14} /> RIGOROUS SPACE REASONING ENGINE
-        </div>
-        <h1>
-          Ask the universe.<br />
-          <em>Explore every frontier.</em>
-        </h1>
-        <p className="hero-copy">
-          A high-accuracy scientific reasoning engine for astrophysics, orbital mechanics, planetary science, and cosmology. Features deep online Web RAG and verified offline astrodynamics.
-        </p>
-      </section>
-
       <section className="workspace" aria-label="SpaceLLM workspace">
         <div className="mode-switch" role="group" aria-label="Inference mode">
           {(Object.keys(modeLabels) as InferenceMode[]).map((mode) => (
@@ -730,14 +717,6 @@ export default function Page() {
           </div>
         </form>
 
-        <div className="examples">
-          <span>Try an example</span>
-          {examples.map((example) => (
-            <button type="button" key={example} onClick={() => setQuestion(example)}>
-              {example}
-            </button>
-          ))}
-        </div>
       </section>
 
       {(answer || loading || error) && (
