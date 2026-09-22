@@ -10,7 +10,10 @@ import { OFFLINE_SPACE_CORPUS } from '@/lib/space-knowledge'
 import {
   getRequestedAnswerStyle,
   getRequestedLineCount,
+  isDetailedDerivationRequest,
   limitAnswerToRequestedLines,
+  removeUnwantedPromotions,
+  solveBasicArithmetic,
   synthesizeAccurateAnswer,
 } from '@/lib/answer-synthesizer'
 
@@ -47,18 +50,6 @@ function appendWikipediaReferences(answer: string, chunks: RetrievedChunk[]) {
     : '> No directly relevant Wikipedia source was retrieved for this question.'
 
   return `${answer.trim()}\n\n### Grounded Wikipedia Sources & References\n\n${sourceBody}`
-}
-
-function removePollinationsPromotion(text: string) {
-  return text
-    .replace(
-      /(?:#{1,6}\s*)?(?:\*{0,2}\s*)?(?:🌸\s*\*{0,2}\s*Ad\s*\*{0,2}\s*🌸\s*)?(?:\*{0,2}\s*)?Support\s+\[?Pollinations\.AI\]?\s*(?:\([^)]*\))?\s*:?[\s\S]{0,700}?(?:to\s+keep\s+AI\s+accessible\s+for\s+everyone|accessible\s+for\s+everyone)\.?\s*(?:\*{0,2})/giu,
-      '\n',
-    )
-    .replace(/(?:🌸\s*\*{0,2}\s*Ad\s*\*{0,2}\s*🌸\s*)?Powered\s+by\s+Pollinations\.AI\s+free\s+text\s+APIs?\.?[\s\S]{0,500}?(?:Support\s+our\s+mission|accessible\s+for\s+everyone)\.?/giu, '\n')
-    .replace(/(?:🌸\s*\*{0,2}\s*Ad\s*\*{0,2}\s*🌸\s*|Support\s+Pollinations\.AI|Powered\s+by\s+Pollinations\.AI[^\n]*)/giu, '\n')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim()
 }
 
 function isMathQuestion(question: string) {
@@ -131,7 +122,7 @@ ${context || 'No directly relevant search context was found. Answer the user usi
 
     if (response.ok) {
       const text = await response.text()
-      const cleanText = removePollinationsPromotion(text)
+      const cleanText = removeUnwantedPromotions(text)
       if (cleanText.length > 80) {
         return cleanText
       }
@@ -155,7 +146,7 @@ ${context || 'No directly relevant search context was found. Answer the user usi
 
     if (fallbackRes.ok) {
       const text = await fallbackRes.text()
-      const cleanText = removePollinationsPromotion(text)
+      const cleanText = removeUnwantedPromotions(text)
       if (cleanText.length > 80) {
         return cleanText
       }
@@ -179,6 +170,10 @@ export async function POST(req: NextRequest) {
     }
 
     const trimmedQuestion = question.trim()
+    const basicArithmetic = solveBasicArithmetic(trimmedQuestion)
+    if (basicArithmetic) {
+      return NextResponse.json({ answer: basicArithmetic, sources: [] })
+    }
     const mathMode = isMathQuestion(trimmedQuestion)
 
     // 1. Live Web RAG retrieval (multi-query Wikipedia deep extracts, relevance gated).
@@ -230,6 +225,19 @@ export async function POST(req: NextRequest) {
       6,
     )
 
+    if (isDetailedDerivationRequest(trimmedQuestion)) {
+      const derivation = synthesizeAccurateAnswer({
+        question: trimmedQuestion,
+        retrievedChunks: topChunks,
+        attachment,
+        mode: 'offline-cpu',
+      })
+      return NextResponse.json({
+        answer: limitAnswerToRequestedLines(derivation, trimmedQuestion),
+        sources: topChunks,
+      })
+    }
+
     // Let the online model answer the user's actual question. Retrieved passages
     // improve factual accuracy, but they are supporting context rather than a
     // whitelist of questions the assistant is allowed to answer.
@@ -246,7 +254,7 @@ export async function POST(req: NextRequest) {
     const answerWithReferences = mathMode ? generatedAnswer : appendWikipediaReferences(generatedAnswer, webRanked)
 
     return NextResponse.json({
-      answer: limitAnswerToRequestedLines(answerWithReferences, trimmedQuestion),
+      answer: removeUnwantedPromotions(limitAnswerToRequestedLines(answerWithReferences, trimmedQuestion)),
       sources: topChunks,
     })
   } catch (error: any) {

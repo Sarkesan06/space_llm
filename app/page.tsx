@@ -6,7 +6,7 @@ import SpaceVisualizer from '@/components/space-visualizer'
 import ColorSpaceLab from '@/components/color-space-lab'
 import { OFFLINE_SPACE_CORPUS, SPACE_CONSTANTS, CELESTIAL_BODIES } from '@/lib/space-knowledge'
 import { fetchWikipediaDeepExtracts, chunkArticleText, deduplicateChunks, RetrievedChunk } from '@/lib/web-retriever'
-import { getRequestedAnswerStyle, limitAnswerToRequestedLines, synthesizeAccurateAnswer } from '@/lib/answer-synthesizer'
+import { getRequestedAnswerStyle, isDetailedDerivationRequest, limitAnswerToRequestedLines, removeUnwantedPromotions, synthesizeAccurateAnswer } from '@/lib/answer-synthesizer'
 
 const MODEL_ID = 'Qwen/Qwen2.5-0.5B-Instruct'
 const EMBEDDING_MODEL_ID = 'Xenova/bge-small-en-v1.5'
@@ -194,7 +194,7 @@ function renderFormattedLine(line: string) {
 }
 
 function renderAnswer(text: string) {
-  const lines = normalizeAnswerMarkup(text).split('\n')
+  const lines = normalizeAnswerMarkup(removeUnwantedPromotions(text)).split('\n')
   const elements: React.ReactNode[] = []
   let inTable = false
   let tableRows: string[][] = []
@@ -283,7 +283,6 @@ function renderAnswer(text: string) {
 
     // Horizontal line
     if (/^---+$/.test(trimmed)) {
-      elements.push(<hr key={`hr-${index}`} className="my-4 border-t border-emerald-100" />)
       continue
     }
 
@@ -522,6 +521,18 @@ export default function Page() {
       setRagStatus(`Offline RAG · indexing verified offline astrophysics corpus…`)
       const offlineChunks = buildOfflineCorpusChunks(attachment)
 
+      if (isDetailedDerivationRequest(questionText)) {
+        setRagStatus('Grounded derivation · applying verified step-by-step template…')
+        const derivation = synthesizeAccurateAnswer({
+          question: questionText,
+          retrievedChunks: offlineChunks,
+          attachment,
+          mode: inferenceMode,
+        })
+        setAnswer(derivation)
+        return
+      }
+
       let model: any = null
       try {
         model = await loadModel()
@@ -748,7 +759,7 @@ export default function Page() {
           ) : (
             <div className="answer-body">
               {renderAnswer(answer)}
-              <button className="copy-button" type="button" onClick={() => navigator.clipboard?.writeText(answer)}>
+              <button className="copy-button" type="button" onClick={() => navigator.clipboard?.writeText(removeUnwantedPromotions(answer))}>
                 <Copy size={14} /> Copy solution
               </button>
             </div>

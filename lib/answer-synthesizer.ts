@@ -51,6 +51,80 @@ export function limitAnswerToRequestedLines(answer: string, question: string) {
     .join('\n')
 }
 
+function evaluateBasicExpression(expression: string): { result: number; steps: string[] } | null {
+  const tokens = expression.match(/\d+(?:\.\d+)?|[()+\-*/^]/g)
+  if (!tokens || tokens.join('') !== expression.replace(/\s+/g, '')) return null
+
+  const values: number[] = []
+  const operators: string[] = []
+  const steps: string[] = []
+  const precedence: Record<string, number> = { '+': 1, '-': 1, '*': 2, '/': 2, '^': 3 }
+  const applyOperator = () => {
+    const operator = operators.pop()
+    const right = values.pop()
+    const left = values.pop()
+    if (!operator || left === undefined || right === undefined) return false
+    if (operator === '/' && right === 0) return false
+    const result = operator === '+' ? left + right : operator === '-' ? left - right : operator === '*' ? left * right : operator === '/' ? left / right : left ** right
+    values.push(result)
+    steps.push(`${left} ${operator} ${right} = ${result}`)
+    return true
+  }
+
+  for (const token of tokens) {
+    if (/^\d/.test(token)) {
+      values.push(Number(token))
+      continue
+    }
+    if (token === '(') {
+      operators.push(token)
+      continue
+    }
+    if (token === ')') {
+      while (operators.at(-1) && operators.at(-1) !== '(') {
+        if (!applyOperator()) return null
+      }
+      if (operators.pop() !== '(') return null
+      continue
+    }
+    while (true) {
+      const topOperator = operators.at(-1)
+      if (!topOperator || topOperator === '(' || precedence[topOperator] < precedence[token]) break
+      if (!applyOperator()) return null
+    }
+    operators.push(token)
+  }
+
+  while (operators.length) {
+    if (operators.at(-1) === '(' || !applyOperator()) return null
+  }
+  return values.length === 1 && Number.isFinite(values[0]) ? { result: values[0], steps } : null
+}
+
+export function solveBasicArithmetic(question: string): string | null {
+  if (isDetailedDerivationRequest(question)) return null
+  const expression = question.match(/(?<![\w.])\d+(?:\.\d+)?(?:\s*[+\-*/^]\s*(?:\d+(?:\.\d+)?|\([^()]*\)))+(?![\w.])/i)?.[0]
+  if (!expression) return null
+  const calculation = evaluateBasicExpression(expression)
+  if (calculation === null) return null
+  const formatted = Number.isInteger(calculation.result) ? String(calculation.result) : String(Number(calculation.result.toFixed(12)))
+  const steps = calculation.steps.map((step, index) => `${index + 2}. ${step}`).join('\n')
+  return `**Final Answer:** ${formatted}\n\n**Step-by-step calculation**\n1. Start with: ${expression}\n${steps}`
+}
+
+export function isDetailedDerivationRequest(question: string) {
+  return /\bderive|derivation|derivative\b/i.test(question)
+}
+
+export function removeUnwantedPromotions(text: string) {
+  return text
+    .replace(/(?:^|\n)\s*(?:#{1,6}\s*)?(?:\*{1,2}\s*)?Support\s+Pollinations\.AI\s*:?[ \t]*\n?/giu, '\n')
+    .replace(/(?:^|\n)\s*(?:#{1,6}\s*)?(?:\*{1,2}\s*)?Support\s+\[Pollinations\.AI\]\([^)]*\)\s*:?[\s\S]*?(?=\n\n|$)/giu, '\n')
+    .replace(/(?:^|\n)\s*(?:#{1,6}\s*)?(?:\*{1,2}\s*)?Powered\s+by\s+Pollinations\.AI[\s\S]*?(?=\n\n|$)/giu, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+}
+
 type QueryType = 'calculation_derivation' | 'comparison' | 'conceptual_mechanism' | 'mission_telescope' | 'general'
 
 // ----------------------------------------------------------------------
@@ -446,6 +520,9 @@ export function synthesizeAccurateAnswer(options: SynthesisOptions): string {
   const ranked = rankChunksForQuestion(deduplicateChunks(retrievedChunks), question, 6)
   const topChunks = ranked.slice(0, 5)
   const evidence = buildEvidence(topChunks, question)
+  const basicArithmetic = solveBasicArithmetic(question)
+
+  if (basicArithmetic) return limitAnswerToRequestedLines(basicArithmetic, question)
 
   if (isSpaceDefinitionQuery(lowerQ)) {
     return limitAnswerToRequestedLines(generateSpaceDefinitionAnswer(evidence, question), question)
