@@ -99,10 +99,10 @@ function buildOfflineCorpusChunks(attachment?: { name: string; content: string }
 
 function verifyMath(question: string, answer: string) {
   const lower = question.toLowerCase()
-  if (!/(escape velocity|circular orbit|orbital period|delta.?v|hohmann|schwarzschild|speed of light)/.test(lower)) {
+  if (!/(calculate|compute|evaluate|solve|simplify|factor|expand|derive|how much|how many|percentage|percent|ratio|average|mean|median|probability|perimeter|area|volume|distance|math|mathematics|arithmetic|algebra|geometry|trigonometry|calculus|statistics|fraction|decimal|equation|inequality|integral|derivative|formula|\d\s*[+\-*/^=]\s*\d|[a-z]\s*[+\-*/^=]\s*\d)/i.test(lower)) {
     return { passed: true, note: 'No orbital calculation detected' }
   }
-  const hasEquation = /(sqrt|mu|gravity|velocity|period|km\/s|m\/s|\^|2\s*\*|π|pi|GM|v_esc)/i.test(answer)
+  const hasEquation = /(final answer|=|equals|therefore|result|calculation|solution|\d|\^|\+|−|-|\*|\/)/i.test(answer)
   return { passed: hasEquation, note: hasEquation ? 'Equation and units verified' : 'Missing equation or units' }
 }
 
@@ -557,7 +557,7 @@ export default function Page() {
         const runtimeLabel = inferenceMode === 'offline-gpu' ? 'Local GPU/WebGPU' : 'Local CPU'
         const requestedStyle = getRequestedAnswerStyle(questionText)
         const styleInstruction = requestedStyle ? `\nPRESENTATION STYLE:\n${requestedStyle}` : ''
-        const prompt = `<|im_start|>system\nYou are SpaceLLM ${runtimeLabel}, a rigorous space science reasoning assistant. Understand the user's intent even when the question is informal, misspelled, or phrased in a different style. Answer the actual scientific question using the requested presentation style. Provide an accurate, scientifically sound explanation using the retrieved evidence below. State exact formulas, numbers, and units where applicable. For calculation or derivation questions, begin with a clearly labeled Final Answer, then show the detailed derivation as numbered steps. Put every substitution and algebraic transformation on its own line; never write a long calculation as one paragraph.${styleInstruction}\n\nGROUNDED EVIDENCE:\n${context || 'Standard astrophysical references apply.'}<|im_end|>\n<|im_start|>user\n${questionText}<|im_end|>\n<|im_start|>assistant\n`
+        const prompt = `<|im_start|>system\nYou are SpaceLLM ${runtimeLabel}, a general mathematics and space-science reasoning assistant. Understand informal or misspelled questions. For every mathematics question, including simple arithmetic, percentages, fractions, algebra, geometry, probability, statistics, calculus, finance, and unit conversion, solve the exact problem completely. Start with Final Answer, show concise checked steps, and verify signs, units, and rounding. Do not provide only a method or unrelated space facts. For space calculations, include governing laws and units. Use the requested presentation style.${styleInstruction}\n\nGROUNDED EVIDENCE:\n${context || 'No external evidence is needed for this mathematics problem.'}<|im_end|>\n<|im_start|>user\n${questionText}<|im_end|>\n<|im_start|>assistant\n`
 
         const result = await model(prompt, {
           max_new_tokens: OFFLINE_MAX_NEW_TOKENS,

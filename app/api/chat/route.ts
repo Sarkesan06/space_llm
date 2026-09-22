@@ -52,20 +52,43 @@ function appendWikipediaReferences(answer: string, chunks: RetrievedChunk[]) {
 function removePollinationsPromotion(text: string) {
   return text
     .replace(
-      /(?:^|\n)\s*(?:🌸\s*Ad\s*🌸\s*)?Support\s+\[Pollinations\.AI\]\(https?:\/\/pollinations\.ai\/?\)\s*:?\s*[\s\S]*?Support\s+our\s+mission\s*to\s*keep\s+AI\s+accessible\s+for\s+everyone\.?\s*/giu,
+      /(?:#{1,6}\s*)?(?:\*{0,2}\s*)?(?:🌸\s*\*{0,2}\s*Ad\s*\*{0,2}\s*🌸\s*)?(?:\*{0,2}\s*)?Support\s+\[?Pollinations\.AI\]?\s*(?:\([^)]*\))?\s*:?[\s\S]{0,700}?(?:to\s+keep\s+AI\s+accessible\s+for\s+everyone|accessible\s+for\s+everyone)\.?\s*(?:\*{0,2})/giu,
       '\n',
     )
+    .replace(/(?:🌸\s*\*{0,2}\s*Ad\s*\*{0,2}\s*🌸\s*)?Powered\s+by\s+Pollinations\.AI\s+free\s+text\s+APIs?\.?[\s\S]{0,500}?(?:Support\s+our\s+mission|accessible\s+for\s+everyone)\.?/giu, '\n')
+    .replace(/(?:🌸\s*\*{0,2}\s*Ad\s*\*{0,2}\s*🌸\s*|Support\s+Pollinations\.AI|Powered\s+by\s+Pollinations\.AI[^\n]*)/giu, '\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim()
 }
 
-async function queryFreeAiModel(_prompt: string, context: string, userQuestion: string): Promise<string> {
+function isMathQuestion(question: string) {
+  return /(calculate|compute|evaluate|solve|simplify|factor|expand|derive|derivation|find the value|how much|how many|percentage|percent|ratio|average|mean|median|probability|perimeter|area|volume|distance|math|mathematics|arithmetic|algebra|geometry|trigonometry|calculus|statistics|fraction|decimal|equation|inequality|integral|derivative|formula|\d\s*[+\-*/^=]\s*\d|[a-z]\s*[+\-*/^=]\s*\d)/i.test(question)
+}
+
+async function queryFreeAiModel(_prompt: string, context: string, userQuestion: string, mathMode = false): Promise<string> {
   const requestedLineCount = getRequestedLineCount(userQuestion)
   const requestedStyle = getRequestedAnswerStyle(userQuestion)
-  const systemPrompt = `You are SpaceLLM, a capable general-purpose AI assistant. Answer the user's actual question across any topic, while using a strong scientific and reasoning style when the question is technical. Do not restrict answers to astronomy or to the supplied search context.
+  const systemPrompt = mathMode
+    ? `You are SpaceLLM Math Solver. Solve the user's mathematics problem directly; do not use a retrieval QA format, Wikipedia, or unrelated context.
+
+MATH RULES:
+- Solve every mathematical problem, including simple arithmetic, word problems, fractions, percentages, algebra, equations, geometry, trigonometry, calculus, probability, statistics, finance, and unit conversions.
+- Start with **Final Answer**.
+- Show the shortest complete step-by-step derivation needed to verify the result. For a one-step problem, show the expression and result.
+- Check arithmetic, signs, units, rounding, domains, and extraneous equation roots.
+- Never replace the solution with general advice. If the problem is ambiguous, state the exact assumption used.
+${requestedLineCount ? `- Keep the solution within ${requestedLineCount} logical lines.` : ''}
+${requestedStyle ? `- Presentation style: ${requestedStyle}` : ''}`
+    : `You are SpaceLLM, a capable general-purpose AI assistant. Answer the user's actual question across any topic, while using a strong scientific and reasoning style when the question is technical. Do not restrict answers to astronomy or to the supplied search context.
 
 RULES:
-1. For CALCULATION and DERIVATION questions:
+1. For ANY MATHEMATICS question, including very small arithmetic problems, word problems, percentages, fractions, algebra, equations, geometry, trigonometry, calculus, probability, statistics, finance, or unit conversion:
+  - Solve the actual problem completely. Do not answer with general advice or only a method.
+  - Start with **Final Answer**, then show concise step-by-step work. For a one-step problem, show the expression and result.
+  - Check the arithmetic, signs, units, rounding, and whether the result answers what was asked.
+  - If information is missing, state exactly what is missing instead of inventing values.
+
+2. For CALCULATION and DERIVATION questions:
   - Start with a clearly labeled **Final Answer** containing the final formula or numerical result, then show the detailed derivation.
   - Provide a rigorous, numbered, step-by-step mathematical derivation using standard LaTeX equations ($$ ... $$ for block formulas, $ ... $ for inline math).
    - Clearly state the governing physical laws (e.g., Conservation of Energy, Newton's laws, Kepler's laws, General Relativity).
@@ -74,16 +97,16 @@ RULES:
   - Show all intermediate algebraic steps and calculations without skipping steps.
    - Provide the final numerical result with appropriate units (e.g., km/s, m/s, AU, km) clearly boxed or bolded.
 
-2. For CONCEPTUAL, COMPARATIVE, and DESCRIPTIVE questions:
+3. For CONCEPTUAL, COMPARATIVE, and DESCRIPTIVE questions:
    - Provide articulate, fluent, well-structured, and engaging explanations in clean Markdown.
    - Use clear headings, bullet points, and markdown comparison tables where appropriate.
    - Do NOT force a rigid artificial step-by-step template onto non-calculation questions; explain naturally and thoroughly.
 
-3. ACCURACY & EVIDENCE:
+4. ACCURACY & EVIDENCE:
   - Use the provided search context when it is relevant, but answer general questions from your broader knowledge when it is not.
   - Be honest about uncertainty and avoid generic filler, hallucinations, or repetitive text.
-${requestedLineCount ? `4. LENGTH: Answer in no more than ${requestedLineCount} concise logical lines because the user explicitly requested that limit.` : ''}
-${requestedStyle ? `5. STYLE: ${requestedStyle}` : ''}
+${requestedLineCount ? `5. LENGTH: Answer in no more than ${requestedLineCount} concise logical lines because the user explicitly requested that limit.` : ''}
+${requestedStyle ? `6. STYLE: ${requestedStyle}` : ''}
 
 OPTIONAL SEARCH CONTEXT:
 ${context || 'No directly relevant search context was found. Answer the user using your general knowledge.'}`
@@ -156,6 +179,7 @@ export async function POST(req: NextRequest) {
     }
 
     const trimmedQuestion = question.trim()
+    const mathMode = isMathQuestion(trimmedQuestion)
 
     // 1. Live Web RAG retrieval (multi-query Wikipedia deep extracts, relevance gated).
     //    Wikipedia occasionally throttles bursts, so a thin result is retried once.
@@ -209,17 +233,17 @@ export async function POST(req: NextRequest) {
     // Let the online model answer the user's actual question. Retrieved passages
     // improve factual accuracy, but they are supporting context rather than a
     // whitelist of questions the assistant is allowed to answer.
-    const context = topChunks
+    const context = mathMode ? '' : topChunks
       .map((chunk, index) => `[${index + 1}] ${chunk.source}: ${chunk.text}`)
       .join('\n\n')
-    const modelAnswer = await queryFreeAiModel('', context, trimmedQuestion)
+    const modelAnswer = await queryFreeAiModel('', context, trimmedQuestion, mathMode)
     const generatedAnswer = modelAnswer || synthesizeAccurateAnswer({
       question: trimmedQuestion,
       retrievedChunks: topChunks,
       attachment,
       mode: 'online',
     })
-    const answerWithReferences = appendWikipediaReferences(generatedAnswer, webRanked)
+    const answerWithReferences = mathMode ? generatedAnswer : appendWikipediaReferences(generatedAnswer, webRanked)
 
     return NextResponse.json({
       answer: limitAnswerToRequestedLines(answerWithReferences, trimmedQuestion),

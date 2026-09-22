@@ -424,7 +424,7 @@ function demoteHeadings(markdown: string): string {
 
 function detectQueryType(query: string): QueryType {
   const lower = query.toLowerCase()
-  if (/(calculate|derive|derivation|escape velocity|delta.?v|hohmann|orbital speed|orbital period|circular orbit|schwarzschild radius|speed of light|formula|equation|maths|physics)/i.test(lower)) {
+  if (/(calculate|compute|evaluate|solve|simplify|factor|expand|derive|derivation|find the value|what is \d|how much|how many|percentage|percent|ratio|average|mean|median|probability|perimeter|area|volume|distance|速度|math|mathematics|arithmetic|algebra|geometry|trigonometry|calculus|statistics|fraction|decimal|equation|inequality|integral|derivative|formula|\d\s*[+\-*/^=]\s*\d|[a-z]\s*[+\-*/^=]\s*\d)/i.test(lower)) {
     return 'calculation_derivation'
   }
   if (/(compare|comparison|versus|\bvs\b|between.*and|difference between)/i.test(lower) || (lower.includes('mars') && (lower.includes('europa') || lower.includes('titan')))) {
