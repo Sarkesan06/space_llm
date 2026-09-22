@@ -49,6 +49,16 @@ function appendWikipediaReferences(answer: string, chunks: RetrievedChunk[]) {
   return `${answer.trim()}\n\n### Grounded Wikipedia Sources & References\n\n${sourceBody}`
 }
 
+function removePollinationsPromotion(text: string) {
+  return text
+    .replace(
+      /(?:^|\n)\s*(?:🌸\s*Ad\s*🌸\s*)?Support\s+\[Pollinations\.AI\]\(https?:\/\/pollinations\.ai\/?\)\s*:?\s*[\s\S]*?Support\s+our\s+mission\s*to\s*keep\s+AI\s+accessible\s+for\s+everyone\.?\s*/giu,
+      '\n',
+    )
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+}
+
 async function queryFreeAiModel(_prompt: string, context: string, userQuestion: string): Promise<string> {
   const requestedLineCount = getRequestedLineCount(userQuestion)
   const requestedStyle = getRequestedAnswerStyle(userQuestion)
@@ -98,8 +108,9 @@ ${context || 'No directly relevant search context was found. Answer the user usi
 
     if (response.ok) {
       const text = await response.text()
-      if (text && text.trim().length > 80) {
-        return text.trim()
+      const cleanText = removePollinationsPromotion(text)
+      if (cleanText.length > 80) {
+        return cleanText
       }
     }
   } catch (err) {
@@ -121,8 +132,9 @@ ${context || 'No directly relevant search context was found. Answer the user usi
 
     if (fallbackRes.ok) {
       const text = await fallbackRes.text()
-      if (text && text.trim().length > 80) {
-        return text.trim()
+      const cleanText = removePollinationsPromotion(text)
+      if (cleanText.length > 80) {
+        return cleanText
       }
     }
   } catch (err) {
