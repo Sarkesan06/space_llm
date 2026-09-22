@@ -12,6 +12,31 @@ import {
 
 export const dynamic = 'force-dynamic'
 
+const stopWords = new Set(['about', 'after', 'also', 'what', 'when', 'where', 'which', 'with', 'from', 'does', 'this', 'that', 'their', 'there', 'into', 'your', 'have', 'will', 'would', 'could', 'should', 'explain', 'please'])
+
+function queryTerms(question: string) {
+  return [...new Set(question.toLowerCase().split(/\W+/).filter((term) => term.length > 2 && !stopWords.has(term)))]
+}
+
+function rankRetrievedChunks(chunks: RetrievedChunk[], question: string, limit = 6) {
+  const terms = queryTerms(question)
+  return deduplicateChunks(chunks)
+    .map((chunk) => {
+      const haystack = `${chunk.source} ${chunk.text}`.toLowerCase()
+      const matches = terms.reduce((score, term) => score + (haystack.includes(term) ? 1 : 0), 0)
+      return { ...chunk, score: matches / Math.max(terms.length, 1) }
+    })
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit)
+}
+
+function answerMatchesQuestion(answer: string, question: string) {
+  const terms = queryTerms(question)
+  if (!terms.length) return true
+  const normalizedAnswer = answer.toLowerCase()
+  return terms.some((term) => normalizedAnswer.includes(term))
+}
+
 async function queryFreeAiModel(prompt: string, context: string, userQuestion: string): Promise<string> {
   const requestedLineCount = getRequestedLineCount(userQuestion)
   const requestedStyle = getRequestedAnswerStyle(userQuestion)
@@ -136,40 +161,15 @@ export async function POST(req: NextRequest) {
       })
     }
 
-    const allChunks = deduplicateChunks([...webChunks, ...localChunks])
-    const topChunks = allChunks.slice(0, 6)
+    const topChunks = rankRetrievedChunks([...webChunks, ...localChunks], trimmedQuestion)
 
-    const contextText = topChunks
-      .map((c, i) => `[${i + 1}] ${c.source}: ${c.text}`)
-      .join('\n\n')
-
-    // 3. Keep the existing online answer, then append the canonical space definition layout.
-    let generatedAnswer = await queryFreeAiModel(trimmedQuestion, contextText, trimmedQuestion)
-
-    // 4. If AI API fails or is offline, use high-accuracy local synthesizer
-    if (!generatedAnswer || generatedAnswer.length < 100) {
-      generatedAnswer = synthesizeAccurateAnswer({
-        question: trimmedQuestion,
-        retrievedChunks: topChunks,
-        attachment,
-        mode: 'online',
-      })
-    } else {
-      // Append verified source links if not already present
-      if (topChunks.length > 0 && !generatedAnswer.toLowerCase().includes('references') && !generatedAnswer.toLowerCase().includes('sources')) {
-        const refs = topChunks
-          .slice(0, 4)
-          .map((c, i) => {
-            const link = c.url ? ` ([Source Link](${c.url}))` : ''
-            return `[${i + 1}] **${c.source}**${link}`
-          })
-          .join('\n')
-        generatedAnswer = `${generatedAnswer}\n\n### References & Verified Sources\n${refs}`
-      }
-      if (isSpaceDefinitionQuery(trimmedQuestion)) {
-        generatedAnswer += `\n\n${generateSpaceDefinitionAnswer()}`
-      }
-    }
+    // 3. Use one grounded structure for every online question after multi-source retrieval.
+    const generatedAnswer = synthesizeAccurateAnswer({
+      question: trimmedQuestion,
+      retrievedChunks: topChunks,
+      attachment,
+      mode: 'online',
+    })
 
     return NextResponse.json({
       answer: limitAnswerToRequestedLines(generatedAnswer, trimmedQuestion),

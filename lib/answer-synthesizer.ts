@@ -62,12 +62,64 @@ function detectQueryType(query: string): QueryType {
   return 'general'
 }
 
+function generateUnifiedRAGAnswer(
+  question: string,
+  queryType: QueryType,
+  chunks: RetrievedChunk[],
+  attachment?: { name: string; content: string } | null
+) {
+  const lowerQuestion = question.toLowerCase()
+  let explanation = ''
+
+  if (queryType === 'calculation_derivation') {
+    if (lowerQuestion.includes('escape velocity')) explanation = generateEscapeVelocityDerivation(lowerQuestion)
+    else if (lowerQuestion.includes('hohmann') || lowerQuestion.includes('transfer') || lowerQuestion.includes('delta-v')) explanation = generateHohmannDerivation()
+    else if (lowerQuestion.includes('schwarzschild') || (lowerQuestion.includes('black hole') && lowerQuestion.includes('radius'))) explanation = generateSchwarzschildDerivation()
+    else if (lowerQuestion.includes('orbital period') || lowerQuestion.includes('kepler')) explanation = generateOrbitalPeriodDerivation()
+    else explanation = generateGeneralCalculationAnswer(question, chunks)
+  } else if (queryType === 'conceptual_mechanism' && (lowerQuestion.includes('black hole') || lowerQuestion.includes('star'))) {
+    explanation = generateBlackHoleNarrative()
+  } else if (queryType === 'mission_telescope' && (lowerQuestion.includes('james webb') || lowerQuestion.includes('jwst'))) {
+    explanation = generateJWSTNarrative()
+  } else if (queryType === 'comparison' && (lowerQuestion.includes('mars') || lowerQuestion.includes('europa') || lowerQuestion.includes('titan'))) {
+    explanation = generatePlanetaryComparisonNarrative()
+  } else {
+    explanation = generateDynamicConceptualAnswer(question, chunks)
+  }
+
+  const evidence = chunks
+    .slice(0, 4)
+    .map((chunk, index) => `- **Evidence ${index + 1}:** ${chunk.text.trim()}`)
+    .join('\n')
+  const references = chunks
+    .slice(0, 4)
+    .map((chunk, index) => {
+      const link = chunk.url ? ` ([Read source](${chunk.url}))` : ''
+      return `[${index + 1}] **${chunk.source}**${link}`
+    })
+    .join('\n')
+
+  let answer = `${explanation}\n\n### Multi-Source Evidence\n${evidence || '- No matching live passage was retrieved; the response uses the verified local astrophysics corpus.'}`
+  if (attachment) answer += `\n\n> **Context from ${attachment.name}:** ${attachment.content.slice(0, 220).replace(/\n/g, ' ')}...`
+  if (references) answer += `\n\n### References & Sources\n${references}`
+  return answer
+}
+
 export function synthesizeAccurateAnswer(options: SynthesisOptions): string {
-  const { question, retrievedChunks, attachment } = options
+  const { question, retrievedChunks, attachment, mode } = options
   const lowerQ = question.toLowerCase().trim()
   const qType = detectQueryType(question)
   const validChunks = deduplicateChunks(retrievedChunks)
   const topChunks = validChunks.slice(0, 5)
+  const isOnline = mode === 'online'
+
+  if (isSpaceDefinitionQuery(lowerQ)) {
+    return limitAnswerToRequestedLines(generateSpaceDefinitionAnswer(), question)
+  }
+
+  if (isOnline) {
+    return limitAnswerToRequestedLines(generateUnifiedRAGAnswer(question, qType, topChunks, attachment), question)
+  }
 
   let answer = ''
 
@@ -130,10 +182,6 @@ export function synthesizeAccurateAnswer(options: SynthesisOptions): string {
       .join('\n')
 
     answer += `\n\n### References & Sources\n${citations}`
-  }
-
-  if (isSpaceDefinitionQuery(lowerQ)) {
-    answer += `\n\n${generateSpaceDefinitionAnswer()}`
   }
 
   return limitAnswerToRequestedLines(answer.trim(), question)
