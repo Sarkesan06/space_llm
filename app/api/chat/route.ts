@@ -1,46 +1,58 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { fetchWikipediaDeepExtracts, RetrievedChunk, deduplicateChunks } from '@/lib/web-retriever'
-import { OFFLINE_SPACE_CORPUS, CELESTIAL_BODIES, SPACE_CONSTANTS } from '@/lib/space-knowledge'
 import {
-  generateSpaceDefinitionAnswer,
+  RetrievedChunk,
+  chunkArticleText,
+  cleanEvidenceText,
+  fetchWikipediaDeepExtracts,
+  rankChunksForQuestion,
+} from '@/lib/web-retriever'
+import { OFFLINE_SPACE_CORPUS } from '@/lib/space-knowledge'
+import {
   getRequestedAnswerStyle,
   getRequestedLineCount,
-  isSpaceDefinitionQuery,
   limitAnswerToRequestedLines,
   synthesizeAccurateAnswer,
 } from '@/lib/answer-synthesizer'
 
 export const dynamic = 'force-dynamic'
 
-const stopWords = new Set(['about', 'after', 'also', 'what', 'when', 'where', 'which', 'with', 'from', 'does', 'this', 'that', 'their', 'there', 'into', 'your', 'have', 'will', 'would', 'could', 'should', 'explain', 'please'])
+function appendWikipediaReferences(answer: string, chunks: RetrievedChunk[]) {
+  if (/grounded wikipedia sources\s*&\s*references/i.test(answer)) return answer
 
-function queryTerms(question: string) {
-  return [...new Set(question.toLowerCase().split(/\W+/).filter((term) => term.length > 2 && !stopWords.has(term)))]
+  const references: string[] = []
+  const seenArticles = new Set<string>()
+
+  for (const chunk of chunks) {
+    if (!chunk.url || !/wikipedia\.org/i.test(chunk.url) || (chunk.relevance ?? 0) < 0.12) continue
+
+    const article = (chunk.article || chunk.source)
+      .replace(/^Wikipedia:\s*/i, '')
+      .replace(/\s*\([^)]*\)\s*$/, '')
+      .trim()
+    const articleKey = `${article.toLowerCase()}|${chunk.url}`
+    if (seenArticles.has(articleKey)) continue
+
+    const excerpt = cleanEvidenceText(chunk.text).replace(/\s+/g, ' ').trim()
+    if (!article || excerpt.length < 40) continue
+
+    seenArticles.add(articleKey)
+    references.push(
+      `[${references.length + 1}] **Wikipedia: ${article}** ([Link](${chunk.url}))\n\n> ${excerpt.slice(0, 420)}${excerpt.length > 420 ? '...' : ''}`,
+    )
+    if (references.length >= 6) break
+  }
+
+  const sourceBody = references.length
+    ? references.join('\n\n')
+    : '> No directly relevant Wikipedia source was retrieved for this question.'
+
+  return `${answer.trim()}\n\n### Grounded Wikipedia Sources & References\n\n${sourceBody}`
 }
 
-function rankRetrievedChunks(chunks: RetrievedChunk[], question: string, limit = 6) {
-  const terms = queryTerms(question)
-  return deduplicateChunks(chunks)
-    .map((chunk) => {
-      const haystack = `${chunk.source} ${chunk.text}`.toLowerCase()
-      const matches = terms.reduce((score, term) => score + (haystack.includes(term) ? 1 : 0), 0)
-      return { ...chunk, score: matches / Math.max(terms.length, 1) }
-    })
-    .sort((a, b) => b.score - a.score)
-    .slice(0, limit)
-}
-
-function answerMatchesQuestion(answer: string, question: string) {
-  const terms = queryTerms(question)
-  if (!terms.length) return true
-  const normalizedAnswer = answer.toLowerCase()
-  return terms.some((term) => normalizedAnswer.includes(term))
-}
-
-async function queryFreeAiModel(prompt: string, context: string, userQuestion: string): Promise<string> {
+async function queryFreeAiModel(_prompt: string, context: string, userQuestion: string): Promise<string> {
   const requestedLineCount = getRequestedLineCount(userQuestion)
   const requestedStyle = getRequestedAnswerStyle(userQuestion)
-  const systemPrompt = `You are SpaceLLM, an elite scientific and astrophysics AI reasoning assistant delivering responses of the highest quality (comparable to Claude 3.5 Sonnet and GPT-4o).
+  const systemPrompt = `You are SpaceLLM, a capable general-purpose AI assistant. Answer the user's actual question across any topic, while using a strong scientific and reasoning style when the question is technical. Do not restrict answers to astronomy or to the supplied search context.
 
 RULES:
 1. For CALCULATION and DERIVATION questions:
@@ -58,13 +70,13 @@ RULES:
    - Do NOT force a rigid artificial step-by-step template onto non-calculation questions; explain naturally and thoroughly.
 
 3. ACCURACY & EVIDENCE:
-   - Base your scientific facts on the provided grounded search context and standard physics laws.
-   - Avoid generic filler, hallucinations, or repetitive text.
+  - Use the provided search context when it is relevant, but answer general questions from your broader knowledge when it is not.
+  - Be honest about uncertainty and avoid generic filler, hallucinations, or repetitive text.
 ${requestedLineCount ? `4. LENGTH: Answer in no more than ${requestedLineCount} concise logical lines because the user explicitly requested that limit.` : ''}
 ${requestedStyle ? `5. STYLE: ${requestedStyle}` : ''}
 
-GROUNDED SEARCH EVIDENCE:
-${context || 'Standard astrophysical constants and laws apply.'}`
+OPTIONAL SEARCH CONTEXT:
+${context || 'No directly relevant search context was found. Answer the user using your general knowledge.'}`
 
   const messages = [
     { role: 'system', content: systemPrompt },
@@ -133,46 +145,72 @@ export async function POST(req: NextRequest) {
 
     const trimmedQuestion = question.trim()
 
-    // 1. Live Web RAG Retrieval
+    // 1. Live Web RAG retrieval (multi-query Wikipedia deep extracts, relevance gated).
+    //    Wikipedia occasionally throttles bursts, so a thin result is retried once.
     let webChunks: RetrievedChunk[] = []
     try {
       webChunks = await fetchWikipediaDeepExtracts(trimmedQuestion)
+      if (webChunks.length < 2) {
+        await new Promise((resolve) => setTimeout(resolve, 400))
+        const retry = await fetchWikipediaDeepExtracts(trimmedQuestion)
+        if (retry.length > webChunks.length) webChunks = retry
+      }
     } catch {
       webChunks = []
     }
 
-    // 2. Local Corpus Chunks
+    // 2. Local verified corpus, chunked and relevance filtered like any other source
     const localChunks: RetrievedChunk[] = []
     for (const item of OFFLINE_SPACE_CORPUS) {
-      if (trimmedQuestion.toLowerCase().split(/\W+/).some((w) => w.length > 3 && item.content.toLowerCase().includes(w))) {
-        localChunks.push({
-          source: `Astrophysics Corpus: ${item.title}`,
-          text: item.content,
-          score: 1,
-        })
-      }
+      localChunks.push(
+        ...chunkArticleText(item.content, `Astrophysics Corpus: ${item.title}`, undefined, item.title),
+      )
     }
 
     if (attachment) {
       localChunks.push({
         source: `User Document (${attachment.name})`,
+        article: attachment.name,
         text: attachment.content.slice(0, 3000),
         score: 1,
       })
     }
 
-    const topChunks = rankRetrievedChunks([...webChunks, ...localChunks], trimmedQuestion)
+    // 3. One relevance + diversity ranking shared by every source, so no article can dominate
+    //    and relevance-free articles are dropped before synthesis.
+    const webRanked = rankChunksForQuestion(webChunks, trimmedQuestion, 6)
+    const localRanked = rankChunksForQuestion(localChunks, trimmedQuestion, 2).filter(
+      (chunk) => (chunk.relevance ?? 0) > 0,
+    )
 
-    // 3. Use one grounded structure for every online question after multi-source retrieval.
-    const generatedAnswer = synthesizeAccurateAnswer({
+    // The built-in corpus is a *fallback*: when live retrieval already produced enough
+    // evidence, adding unrelated corpus topics would only dilute the answer. A user
+    // attachment, however, is always treated as first-class evidence.
+    const corpusFallback = webRanked.length >= 3 ? [] : localRanked
+    const attachmentChunks = localRanked.filter((chunk) => chunk.source.startsWith('User Document'))
+    const topChunks = rankChunksForQuestion(
+      [...webRanked, ...corpusFallback, ...attachmentChunks],
+      trimmedQuestion,
+      6,
+    )
+
+    // Let the online model answer the user's actual question. Retrieved passages
+    // improve factual accuracy, but they are supporting context rather than a
+    // whitelist of questions the assistant is allowed to answer.
+    const context = topChunks
+      .map((chunk, index) => `[${index + 1}] ${chunk.source}: ${chunk.text}`)
+      .join('\n\n')
+    const modelAnswer = await queryFreeAiModel('', context, trimmedQuestion)
+    const generatedAnswer = modelAnswer || synthesizeAccurateAnswer({
       question: trimmedQuestion,
       retrievedChunks: topChunks,
       attachment,
       mode: 'online',
     })
+    const answerWithReferences = appendWikipediaReferences(generatedAnswer, webRanked)
 
     return NextResponse.json({
-      answer: limitAnswerToRequestedLines(generatedAnswer, trimmedQuestion),
+      answer: limitAnswerToRequestedLines(answerWithReferences, trimmedQuestion),
       sources: topChunks,
     })
   } catch (error: any) {
