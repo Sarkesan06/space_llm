@@ -10,13 +10,13 @@ import { getRequestedAnswerStyle, limitAnswerToRequestedLines, synthesizeAccurat
 
 const MODEL_ID = 'Qwen/Qwen2.5-0.5B-Instruct'
 const EMBEDDING_MODEL_ID = 'Xenova/bge-small-en-v1.5'
-const MODEL_NAME = 'SpaceLLM RAG'
+const MODEL_NAME = 'SpaceLLM General AI'
 const OFFLINE_MAX_NEW_TOKENS = 1024
 
 type InferenceMode = 'online' | 'offline-cpu' | 'offline-gpu'
 
 const modeLabels: Record<InferenceMode, string> = {
-  online: 'Online · Deep Web RAG',
+  online: 'Online · General AI + Web Context',
   'offline-cpu': 'Offline · Grounded CPU',
   'offline-gpu': 'Offline · Grounded GPU/WebGPU',
 }
@@ -650,8 +650,8 @@ export default function Page() {
 
         <div className="capability-matrix" aria-label="Online and offline capability matrix">
           <div>
-            <strong>Online · Deep Web RAG</strong>
-            <span>Multi-query Wikipedia extracts · live links · accurate derivations &amp; facts</span>
+            <strong>Online · General AI</strong>
+            <span>Answers any question with optional live web context and source links</span>
           </div>
           <div>
             <strong>Offline · CPU/GPU</strong>
@@ -686,7 +686,7 @@ export default function Page() {
 
           <div className="ask-footer">
             <span>
-              {loadingModel ? `Loading local model · ${progress}%` : loading ? ragStatus : 'Deep Web RAG · Wikipedia + Verified Astrophysics Corpus'}
+              {loadingModel ? `Loading local model · ${progress}%` : loading ? ragStatus : 'General AI · optional web context and verified sources'}
             </span>
             <div className="ask-actions">
               <input
@@ -723,7 +723,7 @@ export default function Page() {
         <section className="answer-card" aria-live="polite">
           <div className="answer-top">
             <div className="card-label">
-              <Atom size={15} /> LOCAL RAG SPACE OUTPUT
+              <Atom size={15} /> AI RESPONSE
             </div>
             <button
               className="icon-button"

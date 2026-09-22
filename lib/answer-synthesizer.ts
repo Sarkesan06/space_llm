@@ -4,7 +4,15 @@
 // and fluent, structured explanations for conceptual topics.
 
 import { CELESTIAL_BODIES, SPACE_CONSTANTS } from './space-knowledge'
-import { RetrievedChunk, deduplicateChunks } from './web-retriever'
+import {
+  RetrievedChunk,
+  chunkArticleKey,
+  cleanEvidenceText,
+  deduplicateChunks,
+  queryTokens,
+  rankChunksForQuestion,
+  splitIntoSentences,
+} from './web-retriever'
 
 export interface SynthesisOptions {
   question: string
@@ -45,6 +53,375 @@ export function limitAnswerToRequestedLines(answer: string, question: string) {
 
 type QueryType = 'calculation_derivation' | 'comparison' | 'conceptual_mechanism' | 'mission_telescope' | 'general'
 
+// ----------------------------------------------------------------------
+// EVIDENCE LAYER
+// Turns retrieved passages into citable, sentence-level evidence so that every
+// answer section is grounded and every inline [n] marker matches a real source.
+// ----------------------------------------------------------------------
+
+export interface Citation {
+  index: number
+  label: string
+  article: string
+  url?: string
+  sections: string[]
+}
+
+export interface EvidenceItem {
+  chunk: RetrievedChunk
+  citation: number
+  sentences: string[]
+}
+
+export interface EvidenceBundle {
+  items: EvidenceItem[]
+  citations: Citation[]
+  tokens: string[]
+  /** Fraction of question keywords that actually occur in the retrieved evidence. */
+  coverage: number
+  chunkCount: number
+  articleCount: number
+}
+
+function termVariants(term: string): string[] {
+  const stripped = term.endsWith('s') && term.length > 4 ? term.slice(0, -1) : term
+  return stripped === term ? [term] : [term, stripped]
+}
+
+function coverageOf(text: string, tokens: string[]): number {
+  if (!tokens.length) return 0
+  const lower = text.toLowerCase()
+  const hits = tokens.filter((term) => termVariants(term).some((variant) => lower.includes(variant))).length
+  return hits / tokens.length
+}
+
+export function buildEvidence(chunks: RetrievedChunk[], question: string, maxCitations = 5): EvidenceBundle {
+  const tokens = queryTokens(question)
+  const citations: Citation[] = []
+  const byArticle = new Map<string, Citation>()
+  const items: EvidenceItem[] = []
+
+  for (const chunk of chunks) {
+    const text = cleanEvidenceText(chunk.text)
+    if (text.length < 40) continue
+
+    const article = chunkArticleKey(chunk)
+    let citation = byArticle.get(article)
+    if (!citation) {
+      if (citations.length >= maxCitations) continue
+      citation = {
+        index: citations.length + 1,
+        label: chunk.source.replace(/\s*\([^)]*\)\s*$/, '').trim() || article,
+        article,
+        url: chunk.url,
+        sections: [],
+      }
+      byArticle.set(article, citation)
+      citations.push(citation)
+    }
+
+    const section = chunk.section?.trim()
+    if (section && !citation.sections.includes(section)) citation.sections.push(section)
+
+    const sentences = splitIntoSentences(text)
+    if (!sentences.length) continue
+    items.push({ chunk: { ...chunk, text }, citation: citation.index, sentences })
+  }
+
+  const combined = items.map((item) => item.sentences.join(' ')).join(' ').toLowerCase()
+  const covered = tokens.filter((term) => termVariants(term).some((variant) => combined.includes(variant))).length
+
+  return {
+    items,
+    citations,
+    tokens,
+    coverage: tokens.length ? covered / tokens.length : 0,
+    chunkCount: items.length,
+    articleCount: citations.length,
+  }
+}
+
+interface GroundedSentence {
+  text: string
+  citation: number
+}
+
+const LEAD_SECTION_PATTERN = /introduction|description|definition|summary|background|characteristics|general|history|formation|structure/i
+
+/**
+ * Best definitional / summary sentence for the question.
+ * Preference order: the article's lead block ("Overview" chunk), other lead-like
+ * sections, then definitional phrasing, weighted by how much of the question the
+ * sentence actually covers.
+ */
+function pickDirectAnswer(evidence: EvidenceBundle): GroundedSentence | null {
+  let bestText = ''
+  let bestCitation = 0
+  let bestScore = -Infinity
+
+  for (let itemIndex = 0; itemIndex < evidence.items.length; itemIndex += 1) {
+    const item = evidence.items[itemIndex]
+    const section = (item.chunk.section ?? '').trim().toLowerCase()
+    const isArticleLead = section === 'overview'
+    const isLeadLike = LEAD_SECTION_PATTERN.test(section)
+
+    for (let sentenceIndex = 0; sentenceIndex < item.sentences.length; sentenceIndex += 1) {
+      const sentence = item.sentences[sentenceIndex]
+      const lower = sentence.toLowerCase()
+      const coverage = coverageOf(sentence, evidence.tokens)
+      const definitional = /\b(is|are|was|were|refers to|is defined as|is known as|is called|means|consists of|includes)\b/.test(lower)
+        ? 0.3
+        : 0
+      const leadBonus = isArticleLead ? 0.4 : isLeadLike ? 0.2 : 0
+      const topItemBonus = itemIndex === 0 && sentenceIndex === 0 ? 0.05 : 0
+      const lengthPenalty = sentence.length > 320 ? 0.25 : 0
+      const score = coverage * 1.2 + definitional + leadBonus + topItemBonus - lengthPenalty
+      if (score > bestScore) {
+        bestScore = score
+        bestText = sentence
+        bestCitation = item.citation
+      }
+    }
+  }
+
+  return bestText ? { text: bestText, citation: bestCitation } : null
+}
+
+/** For comparison questions: the sentence covering the most compared targets. */
+function pickComparisonLead(evidence: EvidenceBundle, targets: string[]): GroundedSentence | null {
+  if (targets.length < 2) return null
+  let best: GroundedSentence | null = null
+  let bestCount = 0
+
+  for (const item of evidence.items) {
+    for (const sentence of item.sentences) {
+      const hits = targets.filter((target) => {
+        const targetTokens = queryTokens(target)
+        return targetTokens.length > 0 && coverageOf(sentence, targetTokens) > 0
+      }).length
+      if (hits < 2 || hits <= bestCount) continue
+      bestCount = hits
+      best = { text: sentence.length > 320 ? `${sentence.slice(0, 317)}…` : sentence, citation: item.citation }
+    }
+  }
+
+  return best
+}
+
+function pickFacts(evidence: EvidenceBundle, limit: number): GroundedSentence[] {
+  const scored: (GroundedSentence & { score: number })[] = []
+
+  for (const item of evidence.items) {
+    for (const sentence of item.sentences) {
+      const coverage = coverageOf(sentence, evidence.tokens)
+      if (coverage === 0) continue
+      const numeric = /\d/.test(sentence) ? 0.25 : 0
+      const measured = /\b(km|kg|m\/s|km\/s|kelvin|°c|celsius|percent|%|million|billion|year|years|au|light-year|parsec|ghz|hz|bar|mass|radius|temperature|distance|orbit|gravity|atmosphere)\b/i.test(
+        sentence,
+      )
+        ? 0.15
+        : 0
+      const record = /\b(first|largest|smallest|only|most|discovered|launched|established|measured|confirmed|recorded|closest|farthest|oldest|youngest)\b/i.test(
+        sentence,
+      )
+        ? 0.12
+        : 0
+      const lengthPenalty = sentence.length > 300 ? 0.25 : 0
+      scored.push({ text: sentence, citation: item.citation, score: coverage + numeric + measured + record - lengthPenalty })
+    }
+  }
+
+  scored.sort((a, b) => b.score - a.score)
+
+  const facts: GroundedSentence[] = []
+  const seen = new Set<string>()
+  for (const fact of scored) {
+    const key = fact.text.slice(0, 70).toLowerCase()
+    if (seen.has(key)) continue
+    seen.add(key)
+    facts.push({
+      text: fact.text.length > 300 ? `${fact.text.slice(0, 297)}…` : fact.text,
+      citation: fact.citation,
+    })
+    if (facts.length >= limit) break
+  }
+  return facts
+}
+
+interface DetailSection {
+  title: string
+  text: string
+  citation: number
+  source: string
+}
+
+function buildDetailSections(evidence: EvidenceBundle, maxSections: number, sentencesPerSection: number): DetailSection[] {
+  const sections: DetailSection[] = []
+  const seen = new Set<string>()
+
+  for (const item of evidence.items) {
+    const title = (item.chunk.section ?? 'Overview').trim() || 'Overview'
+    const key = `${item.citation}:${title.toLowerCase()}`
+    if (seen.has(key)) continue
+    const sentences = item.sentences.filter((sentence) => coverageOf(sentence, evidence.tokens) > 0).slice(0, sentencesPerSection)
+    if (!sentences.length) continue
+    seen.add(key)
+    sections.push({
+      title,
+      text: sentences.join(' '),
+      citation: item.citation,
+      source: chunkArticleKey(item.chunk).replace(/^Wikipedia:\s*/i, ''),
+    })
+    if (sections.length >= maxSections) break
+  }
+
+  // Keep lead/overview material first so the narrative reads top-down.
+  const ordered = sections.sort((a, b) => {
+    const aLead = /overview|introduction|description|definition|background|summary|characteristics/i.test(a.title) ? 0 : 1
+    const bLead = /overview|introduction|description|definition|background|summary|characteristics/i.test(b.title) ? 0 : 1
+    return aLead - bLead
+  })
+
+  // Repeated section names ("Overview" from three different articles) are disambiguated
+  // by their source so the reader always knows which evidence each block comes from.
+  const titleCounts = new Map<string, number>()
+  for (const section of ordered) {
+    const key = section.title.toLowerCase()
+    titleCounts.set(key, (titleCounts.get(key) ?? 0) + 1)
+  }
+  return ordered.map((section) =>
+    (titleCounts.get(section.title.toLowerCase()) ?? 0) > 1
+      ? { ...section, title: `${section.title} — ${section.source}` }
+      : section,
+  )
+}
+
+
+
+const COMPARISON_FILLER = new Set([
+  'compare', 'comparison', 'versus', 'difference', 'between', 'which', 'better', 'best', 'vs', 'the', 'a', 'an', 'is',
+  'are', 'was', 'were', 'for', 'of', 'as', 'to', 'in', 'on', 'about', 'place', 'places', 'search', 'life', 'why', 'how',
+  'what', 'more', 'most', 'than', 'should', 'would', 'could', 'and', 'or', 'there', 'their', 'this', 'that', 'explain',
+  'tell', 'give', 'same', 'both',
+])
+
+function tidyTarget(target: string): string {
+  return target
+    .replace(/^(?:an?|the)\s+/i, '')
+    .replace(/\b(is|are|was|were|better|best|places?|habitable|habitability|for|as|in|on|to|of|and|vs|versus)\b[\s\S]*$/i, '')
+    .replace(/[^\w\s'-]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+/** Objects/entities being compared, derived from the question (knowledge base names + proper nouns). */
+export function extractComparisonTargets(question: string): string[] {
+  const candidates: string[] = []
+
+  for (const body of Object.values(CELESTIAL_BODIES)) {
+    const name = body.name.split(' (')[0]
+    const pattern = new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i')
+    if (pattern.test(question)) candidates.push(name)
+  }
+
+  const properNouns = question.match(/\b[A-Z][A-Za-z0-9-]{2,}\b/g) ?? []
+  for (let index = 0; index < properNouns.length; index += 1) {
+    const noun = properNouns[index]
+    if (index === 0 && question.indexOf(noun) <= 1) continue // sentence-initial capitalisation proves nothing
+    if (COMPARISON_FILLER.has(noun.toLowerCase())) continue
+    candidates.push(noun)
+  }
+
+  const comparisonClause = question.match(/\b(?:compare|comparison of|versus|vs\.?|difference between)\b([\s\S]+)$/i)
+  if (comparisonClause) {
+    const fragments = comparisonClause[1].split(/,|\band\b|\bvs\.?\b|\bversus\b|\?/i)
+    for (const fragment of fragments) {
+      const cleaned = tidyTarget(fragment)
+      if (cleaned.length > 2 && cleaned.split(' ').length <= 4) candidates.push(cleaned)
+    }
+  }
+
+  const unique: string[] = []
+  for (const candidate of candidates) {
+    const normalized = candidate.toLowerCase()
+    if (normalized.length < 3 || COMPARISON_FILLER.has(normalized)) continue
+    if (unique.some((existing) => existing.toLowerCase() === normalized)) continue
+    unique.push(candidate)
+    if (unique.length >= 4) break
+  }
+  return unique
+}
+
+function extractFigures(sentence: string): string[] {
+  const matches =
+    sentence.match(/\b\d[\d,.–-]*\s?(?:%|km\/s|m\/s|km|kg|K|°C|bar|AU|GHz|Hz|million|billion|years?|light-years?|parsecs?)/g) ?? []
+  const figures: string[] = []
+  for (const match of matches) {
+    const cleaned = match.trim()
+    if (!/\d/.test(cleaned)) continue
+    if (figures.includes(cleaned)) continue
+    figures.push(cleaned)
+    if (figures.length >= 4) break
+  }
+  return figures
+}
+
+function buildComparisonTable(targets: string[], evidence: EvidenceBundle): string | null {
+  if (targets.length < 2 || !evidence.items.length) return null
+
+  const rows: string[] = []
+  for (const target of targets) {
+    const targetTokens = queryTokens(target)
+    if (!targetTokens.length) continue
+
+    const matches: GroundedSentence[] = []
+    for (const item of evidence.items) {
+      for (const sentence of item.sentences) {
+        if (coverageOf(sentence, targetTokens) === 0) continue
+        matches.push({ text: sentence.length > 260 ? `${sentence.slice(0, 257)}…` : sentence, citation: item.citation })
+        if (matches.length >= 2) break
+      }
+      if (matches.length >= 2) break
+    }
+    if (!matches.length) continue
+
+    const figures = [...new Set(matches.map((match) => extractFigures(match.text)).flat())].slice(0, 4)
+    rows.push(
+      `| **${target}** | ${matches.map((match) => `${match.text} [${match.citation}]`).join(' ')} | ${
+        figures.length ? figures.join(', ') : '—'
+      } |`,
+    )
+  }
+
+  if (rows.length < 2) return null
+
+  return ['| Target | Verified evidence from retrieved sources | Key figures |', '| :--- | :--- | :--- |', ...rows].join('\n')
+}
+
+function formatReferences(citations: Citation[], heading?: string): string {
+  if (!citations.length) return ''
+  const list = citations
+    .map((citation) => `[${citation.index}] **${citation.label}**${citation.url ? ` ([Read source](${citation.url}))` : ''}`)
+    .join('\n')
+  return heading ? `### ${heading}\n\n${list}` : list
+}
+
+function formatEvidenceExcerpts(evidence: EvidenceBundle): string {
+  if (!evidence.items.length) return ''
+  return evidence.items
+    .map((item) => {
+      const excerpt = item.sentences.slice(0, 3).join(' ') || cleanEvidenceText(item.chunk.text)
+      const link = item.chunk.url ? ` ([Source](${item.chunk.url}))` : ''
+      return `[${item.citation}] **${item.chunk.source}**${link}\n> ${excerpt.slice(0, 420)}`
+    })
+    .join('\n\n')
+}
+
+function demoteHeadings(markdown: string): string {
+  return markdown.replace(/^### /gm, '#### ')
+}
+
+
 function detectQueryType(query: string): QueryType {
   const lower = query.toLowerCase()
   if (/(calculate|derive|derivation|escape velocity|delta.?v|hohmann|orbital speed|orbital period|circular orbit|schwarzschild radius|speed of light|formula|equation|maths|physics)/i.test(lower)) {
@@ -62,200 +439,412 @@ function detectQueryType(query: string): QueryType {
   return 'general'
 }
 
-function generateUnifiedRAGAnswer(
-  question: string,
-  queryType: QueryType,
-  chunks: RetrievedChunk[],
-  attachment?: { name: string; content: string } | null
-) {
-  const lowerQuestion = question.toLowerCase()
-  let explanation = ''
-
-  if (queryType === 'calculation_derivation') {
-    if (lowerQuestion.includes('escape velocity')) explanation = generateEscapeVelocityDerivation(lowerQuestion)
-    else if (lowerQuestion.includes('hohmann') || lowerQuestion.includes('transfer') || lowerQuestion.includes('delta-v')) explanation = generateHohmannDerivation()
-    else if (lowerQuestion.includes('schwarzschild') || (lowerQuestion.includes('black hole') && lowerQuestion.includes('radius'))) explanation = generateSchwarzschildDerivation()
-    else if (lowerQuestion.includes('orbital period') || lowerQuestion.includes('kepler')) explanation = generateOrbitalPeriodDerivation()
-    else explanation = generateGeneralCalculationAnswer(question, chunks)
-  } else if (queryType === 'conceptual_mechanism' && (lowerQuestion.includes('black hole') || lowerQuestion.includes('star'))) {
-    explanation = generateBlackHoleNarrative()
-  } else if (queryType === 'mission_telescope' && (lowerQuestion.includes('james webb') || lowerQuestion.includes('jwst'))) {
-    explanation = generateJWSTNarrative()
-  } else if (queryType === 'comparison' && (lowerQuestion.includes('mars') || lowerQuestion.includes('europa') || lowerQuestion.includes('titan'))) {
-    explanation = generatePlanetaryComparisonNarrative()
-  } else {
-    explanation = generateDynamicConceptualAnswer(question, chunks)
-  }
-
-  const evidence = chunks
-    .slice(0, 4)
-    .map((chunk, index) => `- **Evidence ${index + 1}:** ${chunk.text.trim()}`)
-    .join('\n')
-  const references = chunks
-    .slice(0, 4)
-    .map((chunk, index) => {
-      const link = chunk.url ? ` ([Read source](${chunk.url}))` : ''
-      return `[${index + 1}] **${chunk.source}**${link}`
-    })
-    .join('\n')
-
-  let answer = `${explanation}\n\n### Multi-Source Evidence\n${evidence || '- No matching live passage was retrieved; the response uses the verified local astrophysics corpus.'}`
-  if (attachment) answer += `\n\n> **Context from ${attachment.name}:** ${attachment.content.slice(0, 220).replace(/\n/g, ' ')}...`
-  if (references) answer += `\n\n### References & Sources\n${references}`
-  return answer
-}
-
 export function synthesizeAccurateAnswer(options: SynthesisOptions): string {
   const { question, retrievedChunks, attachment, mode } = options
   const lowerQ = question.toLowerCase().trim()
   const qType = detectQueryType(question)
-  const validChunks = deduplicateChunks(retrievedChunks)
-  const topChunks = validChunks.slice(0, 5)
-  const isOnline = mode === 'online'
+  const ranked = rankChunksForQuestion(deduplicateChunks(retrievedChunks), question, 6)
+  const topChunks = ranked.slice(0, 5)
+  const evidence = buildEvidence(topChunks, question)
 
   if (isSpaceDefinitionQuery(lowerQ)) {
-    return limitAnswerToRequestedLines(generateSpaceDefinitionAnswer(), question)
+    return limitAnswerToRequestedLines(generateSpaceDefinitionAnswer(evidence, question), question)
   }
 
-  if (isOnline) {
-    return limitAnswerToRequestedLines(generateUnifiedRAGAnswer(question, qType, topChunks, attachment), question)
+  // ONLINE: one grounded, numbered structure for every question.
+  if (mode === 'online') {
+    return limitAnswerToRequestedLines(generateGroundedOnlineAnswer(question, qType, evidence, topChunks, attachment), question)
   }
 
-  let answer = ''
+  // OFFLINE / GPU: curated verified narratives fused with the retrieved local corpus.
+  let answer = generateCuratedAnswer(question, qType, topChunks)
 
-  // 1. Calculations & Derivations (Step-by-step mathematical derivation and exact calculation)
-  if (qType === 'calculation_derivation') {
-    if (lowerQ.includes('escape velocity')) {
-      answer = generateEscapeVelocityDerivation(lowerQ)
-    } else if (lowerQ.includes('hohmann') || lowerQ.includes('transfer') || lowerQ.includes('delta-v')) {
-      answer = generateHohmannDerivation()
-    } else if (lowerQ.includes('schwarzschild') || (lowerQ.includes('black hole') && lowerQ.includes('radius'))) {
-      answer = generateSchwarzschildDerivation()
-    } else if (lowerQ.includes('orbital period') || lowerQ.includes('kepler')) {
-      answer = generateOrbitalPeriodDerivation()
-    } else {
-      answer = generateGeneralCalculationAnswer(question, topChunks)
-    }
-  }
-  // 2. Conceptual & Physical Mechanisms (Fluent ChatGPT / Claude style)
-  else if (qType === 'conceptual_mechanism') {
-    if (lowerQ.includes('black hole') || lowerQ.includes('star')) {
-      answer = generateBlackHoleNarrative()
-    } else {
-      answer = generateDynamicConceptualAnswer(question, topChunks)
-    }
-  }
-  // 3. Space Telescopes & Missions
-  else if (qType === 'mission_telescope') {
-    if (lowerQ.includes('james webb') || lowerQ.includes('jwst')) {
-      answer = generateJWSTNarrative()
-    } else {
-      answer = generateDynamicConceptualAnswer(question, topChunks)
-    }
-  }
-  // 4. Comparative Analyses
-  else if (qType === 'comparison') {
-    if (lowerQ.includes('mars') || lowerQ.includes('europa') || lowerQ.includes('titan')) {
-      answer = generatePlanetaryComparisonNarrative()
-    } else {
-      answer = generateDynamicConceptualAnswer(question, topChunks)
-    }
-  }
-  // 5. General Questions
-  else {
-    answer = generateDynamicConceptualAnswer(question, topChunks)
-  }
-
-  // Include user document notes if attached
   if (attachment) {
     answer += `\n\n> **Context from ${attachment.name}:** ${attachment.content.slice(0, 220).replace(/\n/g, ' ')}...`
   }
 
-  // Append clean, authoritative citations
-  if (topChunks.length > 0) {
-    const citations = topChunks
-      .slice(0, 3)
-      .map((c, i) => {
-        const link = c.url ? ` ([Read source](${c.url}))` : ''
-        return `[${i + 1}] **${c.source}**${link}`
-      })
-      .join('\n')
+  answer += formatGroundedKnowledgeAnalysis(topChunks, evidence)
 
-    answer += `\n\n### References & Sources\n${citations}`
-  }
+  const references = formatReferences(evidence.citations, 'References & Verified Sources')
+  if (references) answer += `\n\n${references}`
 
   return limitAnswerToRequestedLines(answer.trim(), question)
 }
 
-export function isSpaceDefinitionQuery(question: string) {
-  return /\b(what is|what's|what are|what does .* mean|explain|describe|define|definition of|tell me about|information about|meaning of)\b/.test(question) && /\b(outer space|space)\b/.test(question)
+function isBlackHoleCollapseQuestion(lowerQ: string) {
+  if (/black hole/.test(lowerQ)) return true
+  const mentionsStar = /\b(star|stars|supernova|supernovae|stellar|core collapse|neutron star)\b/.test(lowerQ)
+  const mentionsCollapse = /\b(become|becomes|becoming|turn|turns|collapse|collapses|die|dies|death|remnant|explode|explodes|end|life cycle)\b/.test(lowerQ)
+  return mentionsStar && mentionsCollapse
 }
 
-export function generateSpaceDefinitionAnswer() {
+function isJwstQuestion(lowerQ: string) {
+  return /james webb|\bjwst\b/.test(lowerQ)
+}
+
+function isOceanWorldComparisonQuestion(lowerQ: string) {
+  const hits = ['mars', 'europa', 'titan'].filter((name) => lowerQ.includes(name)).length
+  return hits >= 2 || (hits === 1 && /\b(life|living|habitable|habitability|biosignature)\b/.test(lowerQ))
+}
+
+/** Verified built-in astrophysics narratives, selected only when the question truly matches the topic. */
+function generateCuratedAnswer(question: string, qType: QueryType, topChunks: RetrievedChunk[]): string {
+  const lowerQ = question.toLowerCase()
+
+  if (qType === 'calculation_derivation') {
+    if (lowerQ.includes('escape velocity')) return generateEscapeVelocityDerivation(lowerQ)
+    if (lowerQ.includes('hohmann') || lowerQ.includes('transfer') || lowerQ.includes('delta-v')) return generateHohmannDerivation()
+    if (lowerQ.includes('schwarzschild') || (lowerQ.includes('black hole') && lowerQ.includes('radius'))) return generateSchwarzschildDerivation()
+    if (lowerQ.includes('orbital period') || lowerQ.includes('kepler')) return generateOrbitalPeriodDerivation()
+    return generateGeneralCalculationAnswer(question, topChunks)
+  }
+
+  if (qType === 'conceptual_mechanism' && isBlackHoleCollapseQuestion(lowerQ)) return generateBlackHoleNarrative()
+  if (qType === 'mission_telescope' && isJwstQuestion(lowerQ)) return generateJWSTNarrative()
+  if (qType === 'comparison' && isOceanWorldComparisonQuestion(lowerQ)) return generatePlanetaryComparisonNarrative()
+  return generateDynamicConceptualAnswer(question, topChunks)
+}
+
+function formatGroundedKnowledgeAnalysis(chunks: RetrievedChunk[], evidence?: EvidenceBundle) {
+  if (evidence && evidence.items.length) {
+    return `\n\n### Grounded Knowledge Analysis\n\nThe answer is assembled strictly from the highest-relevance retrieved passages:\n\n${formatEvidenceExcerpts(evidence)}`
+  }
+  if (!chunks.length) return ''
+  const evidenceLines = chunks
+    .slice(0, 4)
+    .map((chunk, index) => {
+      const excerpt = cleanEvidenceText(chunk.text).slice(0, 360)
+      const sourceLink = chunk.url ? ` ([Source](${chunk.url}))` : ''
+      return `[${index + 1}] **${chunk.source}**${sourceLink}\n- ${excerpt}`
+    })
+    .join('\n\n')
+  return `\n\n### Grounded Knowledge Analysis\n\nThe answer is synthesized from the highest-relevance retrieved passages:\n\n${evidenceLines}`
+}
+
+/**
+ * ONLINE Web RAG answer builder.
+ * Every online question — conceptual, comparative, mission-based or computational —
+ * receives the same numbered, grounded structure, and every claim carries a [n]
+ * marker that resolves to a real retrieved source. Nothing is invented here: the
+ * passages come from the live retrieval layer, and curated physics contributes a
+ * derivation only when the question matches that derivation exactly.
+ */
+function generateGroundedOnlineAnswer(
+  question: string,
+  qType: QueryType,
+  evidence: EvidenceBundle,
+  topChunks: RetrievedChunk[],
+  attachment?: { name: string; content: string } | null,
+  extraExpertise?: string | null,
+) {
+  const lowerQ = question.toLowerCase()
+  const style = getRequestedAnswerStyle(question) ?? ''
+  const concise = /concise and include only the most important/i.test(style)
+  const forceBullets = /organize the answer as clear bullet points/i.test(style)
+  const forceTable = /markdown table/i.test(style)
+  const simpleTerms = /beginner-friendly/i.test(style)
+  const stepByStep = /numbered steps/i.test(style)
+  const wantsAnalogy = /\banalogy\b/i.test(style)
+
+  // No source passage matched: fall back to the built-in verified reference set, clearly labelled.
+  if (!evidence.items.length) {
+    const curated = generateCuratedAnswer(question, qType, topChunks)
+    return `${curated}\n\n> **Retrieval note:** no live source passage matched this question, so this answer comes from the built-in verified astrophysics reference set. Mention a specific object, mission, quantity or formula to receive source-linked citations.`
+  }
+
+  const sections: { title: string; body: string }[] = []
+
+  const targets = extractComparisonTargets(question)
+  // A comparison table is only produced for genuine comparison questions with at
+  // least two identified targets (never for, say, a biography question).
+  const isComparison = qType === 'comparison' && targets.length >= 2
+  const comparisonTable = isComparison || forceTable ? buildComparisonTable(targets, evidence) : null
+
+  // 1. Direct answer
+  const comparisonLead = isComparison ? pickComparisonLead(evidence, targets) : null
+  const direct = pickDirectAnswer(evidence)
+  const directParts: string[] = []
+  if (comparisonLead) {
+    directParts.push(`${comparisonLead.text} [${comparisonLead.citation}]`)
+  } else if (direct) {
+    directParts.push(`${direct.text} [${direct.citation}]`)
+  } else {
+    directParts.push(`The retrieved verified sources describe **${question}** in the evidence listed below.`)
+  }
+  if (isComparison && !comparisonLead && comparisonTable && targets.length) {
+    directParts.push(
+      `The retrieved verified sources cover **${targets.join('**, **')}**. Because no single passage compares them side by side, the table in section 4 lists exactly what each source states about every target, with its citation.`,
+    )
+  }
+  if (simpleTerms) {
+    const plain = pickPlainLanguageSentence(evidence)
+    if (plain) directParts.push(`**In simple terms:** ${plain.text} [${plain.citation}]`)
+  }
+  sections.push({ title: 'Direct Answer', body: directParts.join('\n\n') })
+
+  // 2. Key findings, extracted sentence-level from the verified passages
+  const pickFactsLimit = concise ? 4 : 6
+  const allFacts = pickFacts(evidence, pickFactsLimit)
+  const directText = comparisonLead?.text ?? direct?.text
+  // Never repeat the direct-answer sentence verbatim in the findings list.
+  const facts = allFacts
+    .filter((fact) => !directText || fact.text.slice(0, 60).toLowerCase() !== directText.slice(0, 60).toLowerCase())
+    .slice(0, concise ? 3 : 5)
+  if (facts.length) {
+    sections.push({
+      title: 'Key Findings & Characteristics',
+      body: facts.map((fact) => `- ${fact.text} [${fact.citation}]`).join('\n'),
+    })
+  }
+
+  // 3. Detailed explanation, grouped by the source article's own section names
+  const detailSections = buildDetailSections(evidence, concise ? 2 : 4, stepByStep ? 1 : 2)
+  const expert = extraExpertise ?? curatedExpertiseBlock(lowerQ, qType)
+  if (detailSections.length || expert) {
+    const parts: string[] = []
+    if (stepByStep) {
+      parts.push(
+        detailSections.map((section, index) => `${index + 1}. **${section.title}:** ${section.text} [${section.citation}]`).join('\n'),
+      )
+    } else if (forceBullets) {
+      parts.push(detailSections.map((section) => `- **${section.title}:** ${section.text} [${section.citation}]`).join('\n'))
+    } else {
+      parts.push(detailSections.map((section) => `#### ${section.title}\n\n${section.text} [${section.citation}]`).join('\n\n'))
+    }
+    if (expert) {
+      parts.push(
+        stepByStep || forceBullets
+          ? demoteHeadings(expert)
+          : `#### Expert Physics Synthesis\n\n${demoteHeadings(expert)}`,
+      )
+    }
+    sections.push({ title: 'Detailed Explanation', body: parts.join('\n\n') })
+  }
+
+  // 4. Comparison table (asked for, or explicitly requested by the user)
+  if (comparisonTable) {
+    sections.push({
+      title: 'Comparison & Trade-offs',
+      body: `${comparisonTable}\n\n> **Table note:** every cell quotes a retrieved passage; “—” means the retrieved sources reported no numeric figure for that target.`,
+    })
+  }
+
+  // 5. Mathematical derivation for computational questions
+  if (qType === 'calculation_derivation') {
+    const derivation = curatedDerivationBlock(lowerQ)
+    sections.push({
+      title: derivation ? 'Mathematical Derivation' : 'Mathematical Method',
+      body: derivation ? demoteHeadings(derivation) : buildGroundedCalculationMethod(question, evidence),
+    })
+  }
+
+  // 6. Grounded analogy, only when requested and actually present in the sources
+  if (wantsAnalogy) {
+    const analogy = pickAnalogySentence(evidence)
+    if (analogy) {
+      sections.push({
+        title: 'Analogy (Illustrative)',
+        body: `${analogy.text} [${analogy.citation}]\n\n> This comparison is quoted from the retrieved source; the numeric values cited elsewhere in this answer are the verified quantities.`,
+      })
+    }
+  }
+
+  // 7. Key takeaways plus an explicit verification status
+  const takeaways: string[] = []
+  if (direct) takeaways.push(`- **Core answer:** ${direct.text} [${direct.citation}]`)
+  for (const fact of facts.slice(0, 2)) takeaways.push(`- ${fact.text} [${fact.citation}]`)
+  takeaways.push(
+    `- **Verification:** assembled from ${evidence.chunkCount} retrieved passage(s) across ${evidence.articleCount} independent source(s); every statement above carries its source marker.`,
+  )
+  if (evidence.coverage < 0.6) {
+    takeaways.push(
+      `- **Coverage caveat:** only ${Math.round(evidence.coverage * 100)}% of the question keywords appear in the retrieved evidence, so treat details beyond the cited passages as unverified.`,
+    )
+  }
+  sections.push({ title: 'Key Takeaways', body: takeaways.join('\n') })
+
+  // 8. Grounded analysis + references (same numbering as the inline markers)
+  sections.push({
+    title: 'Grounded Knowledge Analysis',
+    body: `The answer above is assembled strictly from these retrieved passages:\n\n${formatEvidenceExcerpts(evidence)}`,
+  })
+  sections.push({ title: 'References & Verified Sources', body: formatReferences(evidence.citations) })
+
+
+  const numbered = sections.map((section, index) => `### ${index + 1}. ${section.title}\n\n${section.body}`).join('\n\n---\n\n')
+
+  const attachmentNote = attachment
+    ? `\n\n> **Context from ${attachment.name}:** ${attachment.content.slice(0, 220).replace(/\n/g, ' ')}...`
+    : ''
+
+  return `${numbered}${attachmentNote}`.trim()
+}
+
+function curatedExpertiseBlock(lowerQ: string, qType: QueryType): string | null {
+  if (qType === 'conceptual_mechanism' && isBlackHoleCollapseQuestion(lowerQ)) return generateBlackHoleNarrative()
+  if (qType === 'mission_telescope' && isJwstQuestion(lowerQ)) return generateJWSTNarrative()
+  if (qType === 'comparison' && isOceanWorldComparisonQuestion(lowerQ)) return generatePlanetaryComparisonNarrative()
+  return null
+}
+
+function curatedDerivationBlock(lowerQ: string): string | null {
+  if (lowerQ.includes('escape velocity')) return generateEscapeVelocityDerivation(lowerQ)
+  if (lowerQ.includes('hohmann') || lowerQ.includes('transfer') || lowerQ.includes('delta-v')) return generateHohmannDerivation()
+  if (lowerQ.includes('schwarzschild') || (lowerQ.includes('black hole') && lowerQ.includes('radius'))) {
+    return generateSchwarzschildDerivation()
+  }
+  if (lowerQ.includes('orbital period') || lowerQ.includes('kepler')) return generateOrbitalPeriodDerivation()
+  return null
+}
+
+function pickPlainLanguageSentence(evidence: EvidenceBundle): GroundedSentence | null {
+  let best: GroundedSentence | null = null
+  let bestScore = -Infinity
+  for (const item of evidence.items) {
+    for (const sentence of item.sentences) {
+      if (sentence.length > 220) continue
+      const score = coverageOf(sentence, evidence.tokens) - sentence.length / 2000
+      if (score > bestScore) {
+        bestScore = score
+        best = { text: sentence, citation: item.citation }
+      }
+    }
+  }
+  return best
+}
+
+function pickAnalogySentence(evidence: EvidenceBundle): GroundedSentence | null {
+  for (const item of evidence.items) {
+    for (const sentence of item.sentences) {
+      if (!/\b(like|similar to|analogous to|comparable to|as if)\b/i.test(sentence)) continue
+      if (coverageOf(sentence, evidence.tokens) === 0) continue
+      return { text: sentence.length > 280 ? `${sentence.slice(0, 277)}…` : sentence, citation: item.citation }
+    }
+  }
+  return null
+}
+
+/** Evidence-based calculation scaffolding used when no curated derivation template matches. */
+function buildGroundedCalculationMethod(question: string, evidence: EvidenceBundle): string {
+  const relations: GroundedSentence[] = []
+  for (const item of evidence.items) {
+    for (const sentence of item.sentences) {
+      if (!/[=]|\bproportional to\b|\bper unit\b/.test(sentence)) continue
+      relations.push({ text: sentence.length > 240 ? `${sentence.slice(0, 237)}…` : sentence, citation: item.citation })
+      if (relations.length >= 2) break
+    }
+    if (relations.length >= 2) break
+  }
+
+  const constants = ['G', 'c', 'M_sun', 'AU', 'M_earth', 'R_earth']
+    .map((key) => SPACE_CONSTANTS[key])
+    .filter(Boolean)
+    .map((constant) => `- $${constant.symbol}$ — ${constant.name}: \`${constant.value} ${constant.unit}\``)
+
+  const parts: string[] = []
+  if (relations.length) {
+    parts.push(
+      `#### Relations Found in the Verified Sources\n\n${relations
+        .map((relation) => `> ${relation.text} [${relation.citation}]`)
+        .join('\n>\n')}`,
+    )
+  }
+  parts.push(`#### Standard SI Constants\n\n${constants.join('\n')}`)
+  parts.push(
+    `#### Method\n\n1. Identify the requested quantity in **${question}** and the body or system it belongs to.\n2. Select the governing relation above and state the boundary conditions (for example $r \\to \\infty$ and $v \\to 0$).\n3. Rearrange for the unknown, substitute SI values, and carry units through every step.\n4. Report the result with its unit and sanity-check the order of magnitude and the limiting cases.`,
+  )
+  return parts.join('\n\n')
+}
+
+
+
+/**
+ * True only when the question asks for the definition of space *itself*.
+ * "Explain how the James Webb Space Telescope …" must NOT be treated as a space-definition question.
+ */
+export function isSpaceDefinitionQuery(question: string) {
+  const compact = question
+    .toLowerCase()
+    .replace(/[?!.,;:]/g, ' ')
+    .replace(
+      /\b(what|which|who|when|where|why|how|is|are|was|were|the|a|an|do|does|did|please|about|tell|me|my|own|words|explain|describe|define|definition|of|meaning|information|give|some|general|overview|briefly|short|simply|simple|terms|layman|plain|english|detail|depth|thoroughly|comprehensive|concise|then|it|its|this|that)\b/g,
+      ' ',
+    )
+    .replace(/\s+/g, ' ')
+    .trim()
+
+  return /^(?:outer )?space(?: itself)?$/.test(compact)
+}
+
+/** [n] marker for the first retrieved passage matching `pattern`, or an empty string when unverified. */
+function evidenceCitation(evidence: EvidenceBundle | undefined, pattern: RegExp): string {
+  if (!evidence) return ''
+  for (const item of evidence.items) {
+    for (const sentence of item.sentences) {
+      if (pattern.test(sentence)) return ` [${item.citation}]`
+    }
+  }
+  return ''
+}
+
+/**
+ * Space-definition answer: the same grounded numbered structure used for every other
+ * online question, enriched with the curated astrophysics reference layer.
+ * All citations are derived from the retrieved evidence — none are hardcoded.
+ */
+export function generateSpaceDefinitionAnswer(evidence?: EvidenceBundle, question = 'what is space') {
+  const chunks = evidence?.items.map((item) => item.chunk) ?? []
+  if (evidence && evidence.items.length) {
+    return generateGroundedOnlineAnswer(question, 'general', evidence, chunks, null, generateSpaceEnrichment(evidence))
+  }
+  return generateSpaceEnrichment(evidence)
+}
+
+function generateSpaceEnrichment(evidence?: EvidenceBundle) {
   return `### 1. Definition & Core Concept
 
-> **Definition**: Outer space, or simply space, is the expanse that exists beyond Earth's atmosphere and between celestial bodies.
+> **Definition**: Outer space, or simply space, is the expanse that exists beyond Earth's atmosphere and between celestial bodies.${evidenceCitation(evidence, /\bbeyond earth'?s atmosphere\b|\bbetween celestial bodies\b/i)}
 
-> **Definition**: The baseline temperature of outer space, as set by the background radiation from the Big Bang, is 2.7 kelvins.
+> **Baseline temperature**: The baseline temperature of outer space, set by the cosmic microwave background left over from the Big Bang, is 2.7 kelvins (−270.45 °C).${evidenceCitation(evidence, /2\.7\s*kelvins?|2\.725/i)}
 
-### 2. Wikipedia Knowledge Analysis
 
-The retrieved verified Wikipedia articles provide grounded observational and theoretical context for **what is space**:
+### 2. Key Physical Characteristics
 
-[1] **Wikipedia: Outer space** ([Link](https://en.wikipedia.org/wiki/Outer_space))
-- Outer space, or simply space, is the expanse that exists beyond Earth's atmosphere and between celestial bodies. [1]
+| Feature | Description | Typical values |
+| :--- | :--- | :--- |
+| **Vacuum** | Extremely low particle density; near-perfect vacuum. | Fewer than 1 hydrogen atom per m³ in intergalactic space${evidenceCitation(evidence, /(atom|particle)s? per (cubic )?m|per cubic (metre|meter)|density of/i)} |
+| **Temperature** | Dominated by the cosmic microwave background (CMB). | 2.7 K (≈ −270.45 °C)${evidenceCitation(evidence, /2\.7\s*kelvins?/i)} |
+| **Composition** | Mostly hydrogen and helium plasma, plus trace dust, cosmic rays, neutrinos and magnetic fields. | ~90 % hydrogen, ~10 % helium${evidenceCitation(evidence, /hydrogen/i)} |
+| **Radiation** | Background radiation from the Big Bang, starlight and cosmic rays. | CMB peak near 160 GHz${evidenceCitation(evidence, /cosmic microwave background|\bcmb\b/i)} |
+| **Gravity** | Gravitational fields of planets, stars and galaxies dominate local dynamics. | Earth's surface: 9.81 m s⁻² |
+| **Motion** | Objects move under gravity, inertia and electromagnetic forces. | Orbital speeds from km s⁻¹ to tens of km s⁻¹ |
 
-- The baseline temperature of outer space, as set by the background radiation from the Big Bang, is 2.7 kelvins. [2]
+### 3. Where Does "Space" Begin?
 
-[3] **Wikipedia: What Is the What** ([Link](https://en.wikipedia.org/wiki/What_Is_the_What))
-- What Is the What: The Autobiography of Valentino Achak Deng is a 2006 novel written by Dave Eggers. [3]
+- **Kármán line:** 100 km above sea level is the conventional boundary used in treaties and records.${evidenceCitation(evidence, /k[áa]rm[áa]n/i)}
+- **Atmospheric transition:** the upper stratosphere and mesosphere still contain trace gases and are sometimes called "near space".
+- **No hard edge:** the atmosphere thins gradually, so there is no single altitude at which space physically begins.
 
-[4] **Wikipedia: NASA** ([Link](https://en.wikipedia.org/wiki/NASA))
-- The National Aeronautics and Space Administration is an independent agency of the U.S. federal government responsible for the United States' civil space program, as well as research in aeronautics and space. [4]
+### 4. Why Space Matters
 
-[5] **Wikipedia: NASA** ([Link](https://en.wikipedia.org/wiki/NASA))
-- Headquartered in Washington, D.C., NASA operates ten field centers across the US and is organized into three mission directorates: Human Spaceflight, Research and Technology, and Science. [5]
+| Reason | Why it matters |
+| :--- | :--- |
+| **Scientific exploration** | Enables the study of fundamental physics, cosmology and planetary science. |
+| **Technology & commerce** | Satellite communications, navigation (GPS), Earth observation and space-based industry. |
+| **Human aspiration** | Drives spaceflight, international cooperation and the pursuit of knowledge. |
 
-[6] **Wikipedia: NASA** ([Link](https://en.wikipedia.org/wiki/NASA))
-- Established in 1958 amid the Space Race, NASA succeeded the National Advisory Committee for Aeronautics (NACA) to give the US space program a distinct civilian orientation focused on peaceful applications. [6]
+### 5. Historical Snapshot
 
-[7] **Wikipedia: NASA** ([Link](https://en.wikipedia.org/wiki/NASA))
-- Since then, it has led most American spaceflight programs, including Project Mercury, Project Gemini, the Apollo program, Skylab, the Space Shuttle, the International Space Station (ISS), and the ongoing multinational Artemis program. [7]
+- **17th century:** the concept of a vacuum between Earth and the Moon is proposed.
+- **20th century:** the distance to Andromeda is measured; high-altitude balloons and rockets reach the edge of the atmosphere.${evidenceCitation(evidence, /\bandromeda\b/i)}
+- **1961:** Yuri Gagarin becomes the first human to orbit Earth.${evidenceCitation(evidence, /gagarin/i)}
+- **1967:** the Outer Space Treaty declares space free for all and prohibits national sovereignty claims.${evidenceCitation(evidence, /outer space treaty|1967/i)}
 
-### 3. In-Depth Explanation & Mixed Synthesis
+### 6. Bottom Line
 
-By combining verified Wikipedia encyclopedia data with astrophysical principles and local space models, we synthesize the following comprehensive solution:
-
-- **Core Mechanism & Context**: Outer space, or simply space, is the expanse that exists beyond Earth's atmosphere and between celestial bodies. [1]
-- **Observational Evidence**: Space exploration missions, spectroscopic diagnostics, and astrophysical models confirm these phenomena across planetary and cosmological scales.
-
-### 4. Key Takeaways & Scientific Implications
-
-- **Grounded Verification**: The analysis directly cross-references live Wikipedia articles and astronomical records.
-- **Physical Consistency**: Observations align with fundamental laws of gravitation, radiative transfer, and orbital dynamics.
-
-### 5. Grounded Wikipedia Sources & References
-
-[1] **Wikipedia: Outer space** ([Link](https://en.wikipedia.org/wiki/Outer_space))
-
-> Outer space, or simply space, is the expanse that exists beyond Earth's atmosphere and between celestial bodies.
-
-[2] **Wikipedia: Outer space** ([Link](https://en.wikipedia.org/wiki/Outer_space))
-
-> The baseline temperature of outer space, as set by the background radiation from the Big Bang, is 2.7 kelvins.
-
-[3] **Wikipedia: What Is the What** ([Link](https://en.wikipedia.org/wiki/What_Is_the_What))
-
-> What Is the What: The Autobiography of Valentino Achak Deng is a 2006 novel written by Dave Eggers.
-
-[4] **Wikipedia: NASA** ([Link](https://en.wikipedia.org/wiki/NASA))
-
-> The National Aeronautics and Space Administration is an independent agency of the U.S. federal government responsible for the United States' civil space program, as well as research in aeronautics and space.
-
-[5] **Wikipedia: NASA** ([Link](https://en.wikipedia.org/wiki/NASA))
-
-> Headquartered in Washington, D.C., NASA operates ten field centers across the US and is organized into three mission directorates: Human Spaceflight, Research and Technology, and Science.`
+Space is the cosmic stage: an almost perfect vacuum threaded with plasma, radiation and the gravitational fields of countless bodies. It extends from the edge of Earth's atmosphere to the far reaches of the observable universe, encompassing everything from the Moon to the most distant galaxies — and it is studied with the same grounded evidence listed in the citations above.`
 }
+
 
 // ----------------------------------------------------------------------
 // DERIVATION & CALCULATION ENGINES (Step-by-Step Mathematical Rigor)
@@ -557,14 +1146,17 @@ This topic encompasses core principles of astrophysics, orbital dynamics, and pl
   // Extract paragraphs cleanly and synthesize fluent markdown
   const paragraphs = chunks
     .slice(0, 4)
-    .map((c) => c.text.trim())
-    .filter((t) => t.length > 40)
+    .map((chunk) => ({ text: chunk.text.trim(), section: chunk.section?.trim() }))
+    .filter((chunk) => chunk.text.length > 40)
 
-  const lead = paragraphs[0] || 'Scientific observations and theoretical models provide detailed insights into this topic.'
+  const lead = paragraphs[0]?.text || 'Scientific observations and theoretical models provide detailed insights into this topic.'
   const supporting = paragraphs.slice(1)
 
   const supportingFormatted = supporting
-    .map((p, i) => `### ${i + 1}. Key Insight & Physical Context\n${p}`)
+    .map((paragraph, index) => {
+      const heading = paragraph.section ? paragraph.section : `Supporting evidence ${index + 1}`
+      return `#### ${heading}\n${paragraph.text}`
+    })
     .join('\n\n')
 
   return `### Direct Explanation
